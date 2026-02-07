@@ -1,8 +1,17 @@
 from nonebot import (
     on_command,
     require,
-    logger
+    logger,
+    on_notice,
+    get_driver
 )
+from nonebot.adapters.onebot.v11 import NoticeEvent
+try:
+    require("nonebot_plugin_apscheduler")
+    from nonebot_plugin_apscheduler import scheduler
+except Exception:
+    scheduler = None
+
 
 plugins = [
     "nonebot_plugin_localstore",
@@ -59,6 +68,11 @@ recover_flie = on_command(
 
 file_arrange = on_command(
     "文件整理",
+    permission= SUPERUSER
+)
+
+auto_backup = on_command(
+    "自动备份群文件",
     permission= SUPERUSER
 )
 
@@ -293,3 +307,214 @@ async def file_arrange_handle(bot: Bot, event: GroupMessageEvent):
     
     logger.info(f"整理完成，耗时：{time.time() - t}s")
     await file_arrange.finish("整理完成！")
+
+
+@auto_backup.handle()
+async def auto_backup_handle(bot: Bot, event: GroupMessageEvent):
+    if not _config.fa_white_group_list:
+        await auto_backup.finish("请配置需要备份的群号！")
+
+    await auto_backup.send("开始自动备份群文件...")
+    
+    for group_id in _config.fa_white_group_list:
+        await perform_group_backup(bot, group_id)
+
+    await auto_backup.finish("自动备份完成！")
+
+
+async def perform_group_backup(bot: Bot, group_id: int):
+    import httpx
+    
+    path = get_plugin_data_dir()
+    logger.info(f"正在备份群：{group_id}")
+    get_file_and_foler = DeleteFile(group_id)
+    
+    try:
+        copys = await get_file_and_foler.get_root_data(bot)
+    except Exception as e:
+        logger.error(f"获取群 {group_id} 文件列表失败: {e}")
+        return
+
+    # Backup root files
+    if not _config.fa_white_folder_list:
+        for i in copys.files:
+            await download_file(bot, group_id, i, path / str(group_id))
+
+    # Backup folders
+    for i in copys.folders:
+        if _config.fa_white_folder_list and i.folder_name not in _config.fa_white_folder_list:
+            logger.debug(f"跳过文件夹：{i.folder_name}")
+            continue
+
+        logger.info(f"正在备份文件夹：{i.folder_name}")
+        try:
+            folder_data = await get_file_and_foler.get_folder_data(bot, i.folder_id)
+            for files in folder_data.files:
+                await download_file(bot, group_id, files, path / str(group_id) / i.folder_name)
+        except Exception as e:
+            logger.error(f"备份文件夹 {i.folder_name} 失败: {e}")
+
+
+async def download_file(bot: Bot, group_id: int, file_info, parent_path: Path):
+    import httpx
+    
+    parent_path.mkdir(parents=True, exist_ok=True)
+    file_path = parent_path / file_info.file_name
+    
+    # Incremental check
+    if file_path.exists():
+        if file_path.stat().st_size == file_info.size:
+            logger.debug(f"文件已存在且大小一致，跳过备份：{file_info.file_name}")
+            return
+        else:
+            logger.info(f"文件已存在但大小不一致，重新备份：{file_info.file_name}")
+
+    logger.info(f"正在备份文件：{file_info.file_name}")
+    try:
+        async with httpx.AsyncClient() as client:
+            try:
+                # Try to get file URL
+                file_url = await bot.call_api(
+                    "get_group_file_url", group_id=group_id, file_id=file_info.file_id
+                )
+                url = file_url.get("url")
+            except Exception:
+                # Fallback or specific error handling if needed
+                logger.warning(f"无法获取文件下载链接：{file_info.file_name}")
+                return
+
+            if not url:
+                return
+
+            response = await client.get(url)
+            response.raise_for_status()
+            
+            with open(file_path, "wb") as f:
+                f.write(response.content)
+            logger.info(f"备份完成：{file_info.file_name}")
+    except Exception as e:
+        logger.error(f"备份文件 {file_info.file_name} 失败: {e}")
+
+
+# Real-time backup listener
+group_file_upload = on_notice(priority=5)
+
+@group_file_upload.handle()
+async def handle_group_file_upload(bot: Bot, event: NoticeEvent):
+    # 检查是否为群文件上传事件
+    if event.notice_type != "group_upload":
+        return
+        
+    group_id = getattr(event, "group_id", None)
+    
+    # Check whitelist
+    if _config.fa_white_group_list:
+        if group_id not in _config.fa_white_group_list:
+            return
+    
+    file_info = getattr(event, "file", None)
+    if not file_info:
+        return
+
+    logger.info(f"检测到群 {group_id} 文件上传：{file_info.name}")
+    
+    try:
+        # Pydantic or dict access helper
+        # f_id = getattr(file_info, "id", None) or file_info.get("id")
+        # Direct access if it's OneBot v11 model
+        file_id = getattr(file_info, "id", None) 
+        if file_id is None:
+             # Fallback if it is a dict
+             file_id = file_info.get("id")
+
+        file_name = getattr(file_info, "name", None)
+        if file_name is None:
+             file_name = file_info.get("name")
+             
+        file_size = getattr(file_info, "size", None)
+        if file_size is None:
+             file_size = file_info.get("size")
+             
+        class FileInfo:
+            def __init__(self, id, name, size):
+                self.file_id = id
+                self.file_name = name
+                self.size = size
+        
+        wrapped_info = FileInfo(file_id, file_name, file_size)
+    except Exception as e:
+        logger.error(f"获取文件信息失败: {str(e)}")
+        return
+    
+    path = get_plugin_data_dir()
+    
+    # If folder whitelist is configured, we must check if this file is in one of those folders
+    if _config.fa_white_folder_list:
+        files_helper = DeleteFile(group_id)
+        try:
+            root_data = await files_helper.get_root_data(bot)
+            found_folder = None
+            
+            # Find folder IDs for whitelisted names
+            target_folders = {} # name -> id
+            for f in root_data.folders:
+                if f.folder_name in _config.fa_white_folder_list:
+                    target_folders[f.folder_name] = f.folder_id
+            
+            # Check each whitelisted folder to see if our file is there
+            # Note: This might be race-condition prone if API is slow vs upload event
+            for folder_name, folder_id in target_folders.items():
+                folder_files = await files_helper.get_folder_data(bot, folder_id)
+                # Check if file_id matches any file in this folder
+                for f in folder_files.files:
+                    if f.file_id == file_id:
+                        found_folder = folder_name
+                        break
+                if found_folder:
+                    break
+            
+            if found_folder:
+                logger.info(f"文件 {file_name} 位于白名单文件夹 {found_folder}，开始备份")
+                save_path = path / str(group_id) / found_folder
+                await download_file(bot, group_id, wrapped_info, save_path)
+            else:
+                logger.info(f"文件 {file_name} 不在白名单文件夹中，跳过备份")
+                return
+
+        except Exception as e:
+            logger.error(f"检查文件文件夹归属失败: {e}")
+            return
+            
+    else:
+        # No whitelist, save to root (or we could try to resolve folder but default to root is safer/simpler)
+        # To mimic backup behavior: existing backup behavior dumps to root if no folder structure known?
+        # Actually backup behavior preserves structure.
+        # But for realtime without whitelist, finding folder is expensive. 
+        # Requirement implies: "If matching whitelist, backup to that folder".
+        # If no whitelist, maybe just backup to root is acceptable as per previous steps.
+        save_path = path / str(group_id)
+        await download_file(bot, group_id, wrapped_info, save_path)
+
+
+# Startup hook
+driver = get_driver()
+@driver.on_bot_connect
+async def _(bot: Bot):
+    if not _config.fa_white_group_list:
+        return
+    
+    logger.info("Bot连接成功，开始执行启动时群文件备份检查...")
+    for group_id in _config.fa_white_group_list:
+        await perform_group_backup(bot, group_id)
+
+
+# Scheduler
+if scheduler and _config.fa_white_group_list:
+    @scheduler.scheduled_job("interval", seconds=_config.fa_backup_interval)
+    async def scheduled_backup():
+        logger.info("开始执行定时群文件备份...")
+        import nonebot
+        bots = nonebot.get_bots()
+        for bot_id, bot in bots.items():
+            for group_id in _config.fa_white_group_list:
+                await perform_group_backup(bot, group_id)

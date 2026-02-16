@@ -509,12 +509,17 @@ async def _(bot: Bot):
 
 
 # Scheduler
-if scheduler and _config.fa_white_group_list:
-    @scheduler.scheduled_job("interval", seconds=_config.fa_backup_interval)
+if scheduler:
+    @scheduler.scheduled_job("cron", hour=2, minute=0, id="group_file_backup")
     async def scheduled_backup():
         logger.info("开始执行定时群文件备份...")
         import nonebot
         bots = nonebot.get_bots()
         for bot_id, bot in bots.items():
-            for group_id in _config.fa_white_group_list:
-                await perform_group_backup(bot, group_id)
+            try:
+                group_list = await bot.get_group_list()
+                for group in group_list:
+                    group_id = group["group_id"]
+                    await perform_group_backup(bot, group_id)
+            except Exception as e:
+                logger.error(f"执行定时备份时获取群列表失败: {e}")
